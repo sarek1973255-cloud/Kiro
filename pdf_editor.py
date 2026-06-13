@@ -349,7 +349,9 @@ class PDFEditor:
             Anchors at y_hi (landscape-left / label side).  Used for header
             fields (e.g. sender 德力西, contract number).
 
-        Font size is NEVER reduced for overflow — text extends beyond y_lo.
+        If the text is wider than the available cell space (cell height minus
+        padding on both sides), the font size is automatically reduced so the
+        text fits within the cell without touching any border.
         A border inset of _BORDER_INSET pt is applied to x.
         """
         if not text:
@@ -363,29 +365,38 @@ class PDFEditor:
         if right_align:
             y_insert = y_hi - self._LEFT_ALIGN_MARGIN
         else:
-            # CENTER: text is placed so the top margin equals the bottom margin.
-            #   y_insert = (y_lo + y_hi + text_width) / 2
-            # For text that fits in the cell, both margins = (cell - width) / 2.
-            # For text wider than the cell, the overflow is split equally so the
-            # text crosses BOTH borders by the same amount — minimising how far
-            # it intrudes into neighbouring cells vs. a one-sided anchor.
+            # Minimum gap from text to each cell border (top and bottom in landscape).
+            _Y_PADDING = 1.5   # pt
+
             text_width = self._measure_text_width(text, fontsize)
+
+            # AUTO-SCALE: if the text is wider than the available space inside
+            # the cell (cell_height − 2×padding), shrink the font proportionally
+            # so the text fits exactly within the padded area.  This prevents
+            # long strings such as "162千克" from overflowing into adjacent cells.
+            # A minimum font size of 4.5pt is enforced to keep text legible.
+            _MIN_FONTSIZE = 4.5
+            available_space = (y_hi - y_lo) - 2 * _Y_PADDING
+            if available_space > 0 and text_width > available_space:
+                scaled_fs = fontsize * (available_space / text_width)
+                if scaled_fs >= _MIN_FONTSIZE:
+                    fontsize = scaled_fs
+                    text_width = self._measure_text_width(text, fontsize)
+
+            # CENTER: place text so the top margin equals the bottom margin.
+            #   y_insert = (y_lo + y_hi + text_width) / 2
             y_insert = (y_lo + y_hi + text_width) / 2
 
-            # CLAMP: prevent text from touching cell borders.
-            # y_insert must not exceed y_hi - padding (top border).
-            # text end (y_insert - text_width) must not go below y_lo + padding.
-            _Y_PADDING = 1.5   # pt — minimum gap from text to cell border
+            # CLAMP: prevent text from touching cell borders after auto-scaling
+            # (guards against measurement rounding).
             y_max_allowed = y_hi - _Y_PADDING
             y_min_end     = y_lo + _Y_PADDING
             # Clamp: if text would start beyond y_hi border, pull it down
             if y_insert > y_max_allowed:
                 y_insert = y_max_allowed
             # If text end would go below y_lo border, push start up
-            # (only if it doesn't violate the y_hi clamp)
             if y_insert - text_width < y_min_end:
                 y_insert = y_min_end + text_width
-                # Re-apply y_hi clamp (text is just too long — prefer y_hi)
                 if y_insert > y_max_allowed:
                     y_insert = y_max_allowed
 
