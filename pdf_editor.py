@@ -38,9 +38,10 @@ import io
 import math
 import os
 import logging
+import tempfile
 import unicodedata
 import urllib.request
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 
 import fitz  # PyMuPDF
 
@@ -78,6 +79,10 @@ class PDFEditor:
     def __init__(self, template_path: str = TEMPLATE_PDF):
         self.template_path = template_path
         self._font_path: Optional[str] = self._resolve_font()
+        # fitz.Font object for TextWriter-based insertion (proper Unicode mapping)
+        self._font: Optional[fitz.Font] = (
+            fitz.Font(fontfile=self._font_path) if self._font_path else None
+        )
         # Cache for text width measurements: (text, fontsize) -> width_pt
         self._width_cache: dict = {}
         # Scratch document used for exact font metric measurements
@@ -392,19 +397,127 @@ class PDFEditor:
         x_insert = x + _BORDER_INSET
 
         try:
-            page.insert_text(
-                (x_insert, y_insert),
+            tw = fitz.TextWriter(page.rect)
+            tw.append(
+                fitz.Point(x_insert, y_insert),
                 text,
-                fontname=_FONT_ALIAS,
+                font=self._font,
                 fontsize=fontsize,
-                rotate=90,
+            )
+            tw.write_text(
+                page,
+                morph=(fitz.Point(x_insert, y_insert), fitz.Matrix(90)),
                 color=(0, 0, 0),
             )
         except Exception as exc:
             log.warning(
-                "insert_text failed at (%.1f, %.1f) text=%r: %s",
+                "TextWriter failed at (%.1f, %.1f) text=%r: %s",
                 x_insert, y_insert, text[:30], exc,
             )
+
+    # ── Font subsetting ─────────────────────────────────────────────────────
+
+    def _collect_all_chars(self, data: DeclarationData) -> Set[int]:
+        """
+        Collect all Unicode codepoints that will be used in the generated PDF.
+
+        This enables pre-subsetting the font with fontTools before PDF
+        generation, avoiding MuPDF's subset_fonts() bug with CFF OpenType
+        fonts (which produces 'Index bounds' errors on certain glyphs).
+        """
+        chars: Set[int] = set()
+
+        def add(text: str) -> None:
+            if text:
+                for ch in unicodedata.normalize("NFKC", text):
+                    chars.add(ord(ch))
+
+        # Page numbers
+        n = len(data.items)
+        pages = self._calc_pages(n)
+        for p in range(1, pages + 1):
+            add(f"{p}/{pages}")
+
+        # Header fields
+        add(data.contract_no)
+        add(data.consignee or "")
+        add(self._fmt_weight(data.gross_weight))
+        add(self._fmt_weight(data.net_weight))
+        add(str(data.packages))
+        if data.sender_name:
+            add(get_chinese_company_name(data.sender_name))
+        if data.pre_entry_no:
+            add(data.pre_entry_no)
+            add(f"*{data.pre_entry_no}*")
+
+        # Static item fields
+        for val in STATIC_ITEM.values():
+            add(val)
+
+        # Per-item fields
+        for item in data.items:
+            add(str(item.item_no))
+            add(item.hs_code)
+            add(item.chinese_name)
+            add(item.qty_str)
+            add(f"{item.unit_price:.4f}")
+            add(item.total_price_str)
+
+        return chars
+
+    def _create_subset_font(self, codepoints: Set[int]) -> Optional[fitz.Font]:
+        """
+        Create a subsetted fitz.Font containing only the given codepoints.
+
+        Uses fontTools to subset the CJK font file, then loads the result
+        as a fitz.Font object. This avoids MuPDF's broken subset_fonts()
+        implementation for CFF-based OpenType fonts.
+
+        Returns the subset Font, or falls back to self._font if subsetting
+        fails (e.g. fontTools not installed).
+        """
+        if not self._font_path or not codepoints:
+            return self._font
+
+        try:
+            from fontTools.subset import Subsetter
+            from fontTools.ttLib import TTFont
+        except ImportError:
+            log.debug("fontTools not available — using full font.")
+            return self._font
+
+        try:
+            # Suppress verbose fontTools logging during subsetting.
+            ft_logger = logging.getLogger("fontTools.subset")
+            ft_level = ft_logger.level
+            ft_logger.setLevel(logging.WARNING)
+
+            tt = TTFont(self._font_path)
+            subsetter = Subsetter()
+            subsetter.populate(unicodes=codepoints)
+            subsetter.subset(tt)
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".otf", delete=False)
+            try:
+                tt.save(tmp.name)
+                tt.close()
+                subset_font = fitz.Font(fontfile=tmp.name)
+                subset_size = os.path.getsize(tmp.name)
+                log.info(
+                    "Font subsetted: %d codepoints, %d KB (from %.1f MB).",
+                    len(codepoints), subset_size // 1024,
+                    os.path.getsize(self._font_path) / 1024 / 1024,
+                )
+                return subset_font
+            finally:
+                ft_logger.setLevel(ft_level)
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        except Exception as exc:
+            log.warning("Font subsetting failed: %s — using full font.", exc)
+            return self._font
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -433,6 +546,16 @@ class PDFEditor:
         assert expected_slots >= n, (
             f"Slot count mismatch: {expected_slots} slots for {n} items"
         )
+
+        # ── Pre-subset font for this specific document ─────────────────
+        # Collect all characters that will be inserted and create a minimal
+        # subset font.  This avoids MuPDF's broken subset_fonts() for CFF
+        # OpenType fonts while keeping the output file small (~140 KB).
+        all_chars = self._collect_all_chars(data)
+        subset_font = self._create_subset_font(all_chars)
+        original_font = self._font
+        if subset_font is not None:
+            self._font = subset_font
 
         # ── Build output document from DEEP-INDEPENDENT page copies ────
         tmpl = fitz.open(self.template_path)
@@ -480,10 +603,6 @@ class PDFEditor:
             # ── STEP 2: Text-only erasure (table lines preserved) ───────
             self._erase_text_in_regions(page, clear_rects)
 
-            # Register the CJK font AFTER erasure (apply_redactions can
-            # rebuild the page resource dict, losing earlier registrations).
-            self._ensure_font_on_page(page)
-
             # ── STEP 3: Write per-page content ─────────────────────────
             self._write_page_number(page, pidx + 1, total)
 
@@ -500,22 +619,19 @@ class PDFEditor:
                     self._write_item(page, ix, data.items[gi])
 
         buf = io.BytesIO()
-        # Subset fonts — only embed the glyphs actually used on each page.
-        # This dramatically reduces file size when using large CJK fonts
-        # (SimSun ≈ 10 MB full → typically < 200 KB subset per page).
-        try:
-            doc.subset_fonts()
-        except AttributeError:
-            # PyMuPDF < 1.23.0: subset_fonts not available
-            log.debug("subset_fonts() not available — skipping font subsetting.")
-        except Exception as exc:
-            log.debug("subset_fonts() failed: %s — continuing without subsetting.", exc)
+        # Font subsetting is handled by _create_subset_font() above using
+        # fontTools.  MuPDF's subset_fonts() has a bug with CFF OpenType fonts
+        # that causes "Index bounds" errors, so we skip it entirely.
 
         # garbage=4: maximum object compaction; deflate=True: stream compression.
         # clean=True: remove unused objects and duplicates (esp. embedded fonts).
         # Together these keep the output file close in size to the template.
         doc.save(buf, garbage=4, deflate=True, clean=True)
         doc.close()
+
+        # Restore the full font for future edits (e.g. reuse of the editor).
+        self._font = original_font
+
         log.info("PDF generated: %d bytes, %d page(s), %d item(s).",
                  buf.tell(), total, n)
         return buf.getvalue()
